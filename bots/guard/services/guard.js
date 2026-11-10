@@ -13,6 +13,9 @@ const { CacheManager } = require('../../../shared/cache');
 const { escapeRegex, sleep } = require('../../../shared/utils/helpers');
 const { MessageStat } = require('../../../shared/models');
 
+// Sayaç penceresi: restart sonrası da anlamlı olsun diye 10dk saklanır
+const COUNTER_WINDOW_MS = 600000;
+
 // Memory state (resetten sonra audit log id'lerinden devam eder)
 let state = null;
 
@@ -31,10 +34,44 @@ function init(bot) {
     lockdownActive: false,
     lockdownUntil: 0,
     securityActions: new Map(), // executorId -> [{ ts, severity }]
-    selfActionLog: new Map() // auditId vs
+    selfActionLog: new Map(), // auditId vs
+    antiNukeCounters: {},
+    deletedChannels: new Map(),
+    deletedRoles: new Map()
   };
   // embeded bot init hook
   bot.guardState = state;
+}
+
+// --- Sayaç kalıcılığı (Mongo) ---
+async function loadCounters(bot) {
+  const { NukeCounter } = require('../../../shared/models');
+  const now = Date.now();
+  const docs = await NukeCounter.find({ guildId: bot.guildId }).lean();
+  for (const doc of docs) {
+    const fresh = (doc.timestamps || []).filter((ts) => ts > now - COUNTER_WINDOW_MS);
+    if (fresh.length) state.antiNukeCounters[doc.key] = fresh;
+  }
+  bot.logger.info(`Nuke sayaçları yüklendi: ${Object.keys(state.antiNukeCounters).length} kayıt`);
+}
+
+async function flushCounters(bot) {
+  const { NukeCounter } = require('../../../shared/models');
+  const now = Date.now();
+  const ops = [];
+  for (const [key, arr] of Object.entries(state.antiNukeCounters || {})) {
+    const fresh = arr.filter((ts) => ts > now - COUNTER_WINDOW_MS);
+    if (!fresh.length) continue;
+    ops.push({
+      updateOne: {
+        filter: { guildId: bot.guildId, key },
+        update: { $set: { timestamps: fresh } },
+        upsert: true
+      }
+    });
+  }
+  if (ops.length) await NukeCounter.bulkWrite(ops);
+  return ops.length;
 }
 
 async function isInWhitelist(bot, executorId) {
@@ -188,10 +225,7 @@ async function handleChannelDelete(channel) {
   } catch { /* yok */ }
 
   if (!executorId || executorId === bot.client.user.id) {
-    if (cfg.restore) {
-      state.deletedChannels = state.deletedChannels || new Map();
-      state.deletedChannels.set(channel.id, channel);
-    }
+    if (cfg.restore) await autoRestoreChannel(bot, channel.id).catch(() => {});
     return;
   }
 
@@ -216,6 +250,7 @@ async function handleChannelDelete(channel) {
       state.deletedChannels = state.deletedChannels || new Map();
       state.deletedChannels.set(channel.id, channel);
     }
+    if (cfg.restore) await autoRestoreChannel(bot, channel.id).catch(() => {});
   }
 }
 
@@ -258,10 +293,7 @@ async function handleRoleDelete(role) {
     if (entry && Date.now() - new Date(entry.createdAt).getTime() < 30000 && entry.executorId !== bot.client.user.id) executorId = entry.executorId;
   } catch { /* yok */ }
   if (!executorId || await isInWhitelist(bot, executorId)) {
-    if (cfg.restore) {
-      state.deletedRoles = state.deletedRoles || new Map();
-      state.deletedRoles.set(role.id, role);
-    }
+    if (cfg.restore) await autoRestoreRole(bot, role.id).catch(() => {});
     return;
   }
   const guild = role.guild;
@@ -281,6 +313,7 @@ async function handleRoleDelete(role) {
       state.deletedRoles = state.deletedRoles || new Map();
       state.deletedRoles.set(role.id, role);
     }
+    if (cfg.restore) await autoRestoreRole(bot, role.id).catch(() => {});
   }
 }
 
@@ -465,8 +498,18 @@ async function handleGuildMemberAdd(member) {
   // account age check
   const ageDays = Math.floor((Date.now() - member.user.createdTimestamp) / 86400000);
   if (ageDays < (bot.config.antiRaid.accountAgeDays ?? 7) && !state.lockdownActive) {
-    const action = bot.config.antiRaid.suspiciousAction;
-    if (action === 'kick') await member.kick(`Yeni hesap girişi engellendi (${ageDays} gün)`).catch(() => {});
+    const action = bot.config.antiRaid.suspiciousAction || 'quarantine';
+    if (action === 'kick') {
+      await member.kick(`Yeni hesap girişi engellendi (${ageDays} gün)`).catch(() => {});
+    } else if (action === 'quarantine') {
+      const roleId = bot.config.antiRaid.quarantineRoleId;
+      if (roleId) {
+        await member.roles.add(roleId, `Şüpheli hesap karantinası (${ageDays} gün)`).catch(() => {});
+        // karantinadayken konuşma kanallarını kapatan rol olması beklenir
+      } else {
+        bot.logger.warn('quarantineRoleId ayarlanmamış, şüpheli hesap sadece loglandı');
+      }
+    }
     await logSecurityEvent('account_age_rejection', { guildId: member.guild.id, executorId: member.id, targetId: member.id, ageDays, action });
   }
 
@@ -616,6 +659,187 @@ async function approveSecurityAction(bot, originalId, approverId) {
   return evt;
 }
 
+// --- Backup sistemi (rol + kanal snapshot, DB kalıcı) ---
+async function takeBackup(bot, reason = 'manual') {
+  const { GuildBackup } = require('../../../shared/models');
+  const guild = bot.client.guilds.cache.get(bot.guildId);
+  if (!guild) return null;
+
+  const roles = guild.roles.cache
+    .filter((r) => !r.managed && r.id !== guild.id && r.editable)
+    .map((r) => ({
+      id: r.id, name: r.name, color: r.color, hoist: r.hoist,
+      permissions: r.permissions.bitfield.toString(), mentionable: r.mentionable,
+      members: r.members.map((m) => m.id),
+      channelOverwrites: guild.channels.cache
+        .filter((c) => c.permissionOverwrites?.cache.has(r.id))
+        .map((c) => {
+          const p = c.permissionOverwrites.cache.get(r.id);
+          return { channelId: c.id, allow: p.allow.bitfield.toString(), deny: p.deny.bitfield.toString(), type: p.type };
+        })
+        .filter(Boolean)
+    }));
+
+  const categories = guild.channels.cache
+    .filter((c) => c.type === 4)
+    .map((c) => ({ id: c.id, name: c.name, position: c.rawPosition }));
+
+  const overwritesOf = (c) => c.permissionOverwrites?.cache.map((p) => ({
+    id: p.id, allow: p.allow.bitfield.toString(), deny: p.deny.bitfield.toString(), type: p.type
+  })) || [];
+
+  const textChannels = guild.channels.cache
+    .filter((c) => c.type === 0 || c.type === 5)
+    .map((c) => ({ id: c.id, name: c.name, parentID: c.parentId, position: c.rawPosition, nsfw: c.nsfw, rateLimit: c.rateLimitPerUser ?? 0, topic: c.topic || '', overwrites: overwritesOf(c) }));
+
+  const voiceChannels = guild.channels.cache
+    .filter((c) => c.type === 2)
+    .map((c) => ({ id: c.id, name: c.name, parentID: c.parentId, position: c.rawPosition, bitrate: c.bitrate, userLimit: c.userLimit, overwrites: overwritesOf(c) }));
+
+  return GuildBackup.create({ guildId: bot.guildId, reason, roles, categories, textChannels, voiceChannels });
+}
+
+async function listBackups(bot, limit = 5) {
+  const { GuildBackup } = require('../../../shared/models');
+  return GuildBackup.find({ guildId: bot.guildId }).sort({ takenAt: -1 }).limit(limit);
+}
+
+// En son yedekten bir rol geri kurar: rol yeniden oluşturulur, izinler
+// ve üyeler verilir. Kalan işi chunked ve paralel yapar.
+async function restoreRoleFromBackup(bot, roleId) {
+  const { GuildBackup, GuildLog } = require('../../../shared/models');
+  const guild = bot.client.guilds.cache.get(bot.guildId);
+  if (!guild) return null;
+  const backup = await GuildBackup.findOne({ guildId: bot.guildId, 'roles.id': roleId }).sort({ takenAt: -1 });
+  if (!backup) return null;
+  const data = backup.roles.find((r) => r.id === roleId);
+  if (!data) return null;
+
+  let restored;
+  try {
+    restored = await guild.roles.create({
+      name: data.name,
+      color: data.color || undefined,
+      hoist: data.hoist,
+      mentionable: data.mentionable,
+      permissions: BigInt(data.permissions || '0') // veri yoksa @everyone
+    });
+  } catch (err) {
+    bot.logger.error(`restoreRoleFromBackup: rol oluşturulamadı: ${err.message}`);
+    return null;
+  }
+
+  // kanal izinleri geri yükle
+  for (const ov of data.channelOverwrites) {
+    const channel = guild.channels.cache.get(ov.channelId);
+    if (!channel) continue;
+    try {
+      await channel.permissionOverwrites.edit(restored, {
+        allow: BigInt(ov.allow || '0'),
+        deny: BigInt(ov.deny || '0')
+      });
+    } catch { /* yok */ }
+  }
+
+  // üyeleri dağıt (rate-limit dostu: paralel chunk)
+  const memberIds = data.members.filter(Boolean);
+  const CHUNK = 25;
+  let assigned = 0;
+  for (let i = 0; i < memberIds.length; i += CHUNK * 5) {
+    const batch = memberIds.slice(i, i + CHUNK * 5);
+    await Promise.all(batch.map(async (id) => {
+      const member = await bot.client.ecosystem.safeMember(guild, id).catch(() => null);
+      if (member) { await member.roles.add(restored.id).catch(() => {}); assigned += 1; }
+    }));
+  }
+
+  await logSecurityEvent('backup_role_restored', {
+    guildId: guild.id, executorId: bot.client.user.id, targetId: restored.id,
+    fromRoleId: roleId, name: data.name, assigned
+  });
+  await GuildLog.create({ guildId: bot.guildId, bot: 'guard', category: 'BACKUP', type: 'role_restore', targetId: restored.id, data: { fromNodeId: roleId, assigned } });
+  return { role: restored, assigned };
+}
+
+// En son yedekten bir kanal geri kurar (metin/ses/kategori fark etmez).
+async function restoreChannelFromBackup(bot, channelId) {
+  const { GuildBackup } = require('../../../shared/models');
+  const guild = bot.client.guilds.cache.get(bot.guildId);
+  if (!guild) return null;
+  const backup = await GuildBackup.findOne({
+    guildId: bot.guildId,
+    $or: [
+      { 'textChannels.id': channelId },
+      { 'voiceChannels.id': channelId },
+      { 'categories.id': channelId }
+    ]
+  }).sort({ takenAt: -1 });
+  if (!backup) return null;
+
+  const tdata = backup.textChannels.find((x) => x.id === channelId);
+  const vdata = backup.voiceChannels.find((x) => x.id === channelId);
+  const cdata = backup.categories.find((x) => x.id === channelId);
+  const data = cdata || tdata || vdata;
+  if (!data) return null;
+
+  const isCategory = Boolean(cdata);
+  const isVoice = Boolean(vdata);
+  let restored;
+  try {
+    if (isCategory) {
+      restored = await guild.channels.create({ name: data.name, type: 4 });
+    } else if (isVoice) {
+      restored = await guild.channels.create({
+        name: data.name, type: 2,
+        bitrate: data.bitrate || 64000,
+        userLimit: data.userLimit || 0
+      });
+    } else {
+      restored = await guild.channels.create({
+        name: data.name, type: 0,
+        nsfw: data.nsfw,
+        rateLimitPerUser: data.rateLimit || 0,
+        topic: data.topic || undefined
+      });
+    }
+  } catch (err) {
+    bot.logger.error(`restoreChannelFromBackup hata: ${err.message}`);
+    return null;
+  }
+
+  for (const ov of data.overwrites || []) {
+    const r = guild.roles.cache.get(ov.id);
+    const m = guild.members.cache.get(ov.id);
+    const target = r ? { id: ov.id, type: 0 } : m ? { id: ov.id, type: 1 } : null;
+    if (!target) continue;
+    try {
+      await restored.permissionOverwrites.edit(target.id, {
+        allow: BigInt(ov.allow || '0'),
+        deny: BigInt(ov.deny || '0')
+      });
+    } catch { /* yok */ }
+  }
+
+  await logSecurityEvent('backup_channel_restored', {
+    guildId: guild.id, executorId: bot.client.user.id, targetId: restored.id,
+    fromChannelId: channelId, name: data.name, kind: cdata ? 'category' : isVoice ? 'voice' : 'text'
+  });
+  return restored;
+}
+
+// Silme olayında DB yedeğinden otomatik restore (in-memory cache'e ek olarak)
+async function autoRestoreChannel(bot, channelId) {
+  const restored = await restoreChannelFromBackup(bot, channelId);
+  if (restored) await logSecurityEvent('auto_restore_channel', { guildId: bot.guildId, executorId: bot.client.user.id, targetId: restored.id });
+  return restored;
+}
+
+async function autoRestoreRole(bot, roleId) {
+  const res = await restoreRoleFromBackup(bot, roleId);
+  if (res) await logSecurityEvent('auto_restore_role', { guildId: bot.guildId, executorId: bot.client.user.id, targetId: res.role.id });
+  return res ? res.role : null;
+}
+
 module.exports = {
   init,
   state: () => state,
@@ -637,6 +861,14 @@ module.exports = {
   approveSecurityAction,
   restoreChannel,
   restoreRole,
+  loadCounters,
+  flushCounters,
+  takeBackup,
+  listBackups,
+  restoreRoleFromBackup,
+  restoreChannelFromBackup,
+  autoRestoreChannel,
+  autoRestoreRole,
   punish,
   logSecurityEvent
 };

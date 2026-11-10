@@ -41,7 +41,7 @@ function dbState() {
 }
 
 async function ensureIndexes() {
-  const models = ['Case', 'GuildSettings', 'EmojiRegistry', 'Stat', 'VoiceStat', 'MemberStat', 'GuildLog', 'Tag', 'TagUser', 'Register', 'Warn', 'Punishment', 'RaidLog', 'SecurityEvent', 'GuildTagHistory', 'Startup'];
+  const models = ['Case', 'GuildSettings', 'EmojiRegistry', 'Stat', 'VoiceStat', 'MemberStat', 'GuildLog', 'Tag', 'TagUser', 'Register', 'Warn', 'Punishment', 'RaidLog', 'SecurityEvent', 'GuildTagHistory', 'Startup', 'GuildBackup', 'NukeCounter'];
   for (const n of models) {
     const M = mongoose.models[n];
     if (M && typeof M.syncIndexes === 'function') {

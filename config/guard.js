@@ -32,7 +32,8 @@ module.exports = {
   antiRaid: {
     joinFlood: { limit: 8, interval: 30000, action: 'lockdown' },
     accountAgeDays: 7,
-    suspiciousAction: 'kick',
+    suspiciousAction: 'quarantine', // kick | quarantine
+    quarantineRoleId: '', // şüpheli hesap bu role girenler; boşsa sadece loglanır
     lockdownDurationMs: 300000,
     autoUnlock: true
   },

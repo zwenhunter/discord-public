@@ -2,6 +2,10 @@
 
 Sunucularım için ihtiyaçtan çıkma bir proje. 5 ayrı bot var, hepsi tek `.env` üzerinden yönetiliyor. Slash komut yok, her şey nokta prefix ile çalışıyor. TypeScript kullanmadım, saf Node.js.
 
+## Neden 5 ayrı bot?
+
+Tek bot her şeyi yapmaya çalışınca bir modül çökünce gerisi de gidiyor. Bundan dolayı guard, moderasyon, istatistik, tag ve kayıt işlemleri ayrı process'lerde. Ortak altyapıyı (veritabanı, cache, logger, izin sistemi, emoji yönetimi) paylaşıyorlar ama biri düşse bile diğerleri çalışmaya devam ediyor. PM2 ile tek tek restart atabilirsin, birini baştan başlatmak diğerlerini etkilemez.
+
 Botlar:
 
 - **Guard** - anti-nuke, anti-raid, anti-spam. Kanal/rol silmeleri, mass ban, webhook kurcalamaları ve izinsiz bot eklemelerini takip ediyor. Audit log eşleştirmesi var; botun kendi yaptığı işlemleri ayırt ediyor ki yanlış kişiyi cezalandırmasın.
@@ -51,6 +55,10 @@ npm test
 ```
 
 Cooldown, rate limit, izin sistemi, süre parse, emoji fallback gibi çekirdek davranışların testleri var. Şu an 27 test geçiyor.
+
+## Ne zaman kullanmayın
+
+Küçük sunucularda bu kadar katman gereksiz olabilir. Proje yoğun, bol moderasyonlu Türkçe sunucular için yazıldı. Komutların çoğu Türkçe isimli (kayıt, kadın, isim gibi) çünkü kullanıcı kitlesi Türk.
 
 ## Not
 

@@ -211,6 +211,43 @@ const RemindSchema = new Schema({
 }, { timestamps: true });
 RemindSchema.index({ dueAt: 1, sent: 1 });
 
+// ---------- Guard Backup ----------
+const GuildBackupSchema = new Schema({
+  guildId: { type: String, required: true },
+  reason: { type: String, default: 'manual' },
+  takenAt: { type: Date, default: Date.now },
+  roles: [{
+    id: String, name: String, color: Number, hoist: Boolean,
+    permissions: String, mentionable: Boolean,
+    members: [{ type: String }],
+    channelOverwrites: [{
+      channelId: String, allow: String, deny: String, type: String
+    }]
+  }],
+  categories: [{
+    id: String, name: String, position: Number
+  }],
+  textChannels: [{
+    id: String, name: String, parentID: String, position: Number,
+    nsfw: Boolean, rateLimit: Number, topic: String,
+    overwrites: [{ id: String, allow: String, deny: String, type: String }]
+  }],
+  voiceChannels: [{
+    id: String, name: String, parentID: String, position: Number,
+    bitrate: Number, userLimit: Number,
+    overwrites: [{ id: String, allow: String, deny: String, type: String }]
+  }]
+}, { timestamps: true });
+GuildBackupSchema.index({ guildId: 1, takenAt: -1 });
+
+// ---------- Nuke sayaç kalıcılığı (restart sonrası devam) ----------
+const NukeCounterSchema = new Schema({
+  guildId: { type: String, required: true },
+  key: { type: String, required: true }, // örn: channelDelete:<executorId>
+  timestamps: [{ type: Number }]
+}, { timestamps: true });
+NukeCounterSchema.index({ guildId: 1, key: 1 }, { unique: true });
+
 module.exports = {
   GuildSettings: mongoose.models.GuildSettings || mongoose.model('GuildSettings', GuildSettingsSchema),
   EmojiRegistry: mongoose.models.EmojiRegistry || mongoose.model('EmojiRegistry', EmojiRegistrySchema),
@@ -227,5 +264,7 @@ module.exports = {
   TagUser: mongoose.models.TagUser || mongoose.model('TagUser', TagUserSchema),
   Register: mongoose.models.Register || mongoose.model('Register', RegisterSchema),
   Remind: mongoose.models.Remind || mongoose.model('Remind', RemindSchema),
-  Startup: mongoose.models.Startup || mongoose.model('Startup', StartupSchema)
+  Startup: mongoose.models.Startup || mongoose.model('Startup', StartupSchema),
+  GuildBackup: mongoose.models.GuildBackup || mongoose.model('GuildBackup', GuildBackupSchema),
+  NukeCounter: mongoose.models.NukeCounter || mongoose.model('NukeCounter', NukeCounterSchema)
 };
